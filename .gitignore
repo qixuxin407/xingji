@@ -1,0 +1,8 @@
+node_modules/
+shots/
+tools/*.png
+*.zip
+*.log
+.DS_Store
+Thumbs.db
+/*.png

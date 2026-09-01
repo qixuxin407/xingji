@@ -1,0 +1,338 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>行迹 · 我的旅行星球</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Ccircle cx='12' cy='12' r='7' fill='%23f5a524'/%3E%3Ccircle cx='12' cy='12' r='11' fill='none' stroke='%23f5a524' stroke-opacity='.45'/%3E%3C/svg%3E" />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Fraunces:ital,wght@0,400;0,600;1,500&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet" />
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "./vendor/three/build/three.module.js",
+        "three/addons/": "./vendor/three/examples/jsm/"
+      }
+    }
+  </script>
+  <link rel="stylesheet" href="./styles.css?v=20260901-8" />
+</head>
+<body>
+  <div id="stage"></div>
+
+  <nav id="top-nav" class="top-nav" aria-label="页面导航">
+    <a href="#/" data-route-link="home">行迹地球</a>
+    <a href="#/timeline" data-route-link="timeline">时间线</a>
+  </nav>
+
+  <aside class="panel" aria-label="旅行记录面板">
+    <header class="brand">
+      <p class="eyebrow">Xingji · Personal Travel Globe</p>
+      <h1>行迹</h1>
+      <p class="lede">在地球上点亮你到过的城市。拖动旋转，滚轮缩放；每次标记都会保存到这台浏览器。</p>
+    </header>
+
+    <section class="search" aria-label="搜索并标记城市">
+      <label class="field">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <circle cx="11" cy="11" r="8" />
+          <path d="m21 21-4.3-4.3" />
+        </svg>
+        <span class="visually-hidden">搜索城市或地区</span>
+        <input id="search-input" type="search" placeholder="搜索你到过的城市，如：杭州、京都"
+               autocomplete="off" spellcheck="false" enterkeyhint="search" />
+      </label>
+      <p id="search-status" class="status" role="status" aria-live="polite">输入地名开始搜索，点击结果即可标记。</p>
+      <ul id="results" class="results" hidden></ul>
+    </section>
+
+    <section class="visited" aria-label="我的足迹">
+      <h2>我的足迹<span id="visited-count" class="count">0</span></h2>
+      <p id="visited-empty" class="empty">还没有足迹。搜到一座去过的城市，点它一下。</p>
+      <ul id="visited-list" class="chips"></ul>
+    </section>
+
+    <footer class="colophon data-actions" aria-label="数据备份">
+      <button id="export-data" class="text-button" type="button">导出备份</button>
+      <button id="import-data" class="text-button" type="button">导入备份</button>
+      <input id="import-input" type="file" accept="application/json,.json" hidden />
+    </footer>
+  </aside>
+
+  <div id="globe-tip" class="tip" hidden></div>
+  <div id="toast" class="toast" hidden></div>
+
+  <div id="lightbox" class="lightbox" role="dialog" aria-modal="true" aria-label="照片浏览" hidden>
+    <button id="lightbox-close" class="icon-button lightbox-close" type="button" title="关闭照片" aria-label="关闭照片">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></svg>
+    </button>
+    <button id="lightbox-prev" class="album-nav lightbox-prev" type="button" title="上一张" aria-label="上一张">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m15 5-7 7 7 7"/></svg>
+    </button>
+    <figure class="lightbox-figure">
+      <img id="lightbox-image" alt="" />
+      <figcaption>
+        <span id="lightbox-caption">照片</span>
+        <span id="lightbox-counter">1 / 1</span>
+      </figcaption>
+    </figure>
+    <button id="lightbox-next" class="album-nav lightbox-next" type="button" title="下一张" aria-label="下一张">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m9 5 7 7-7 7"/></svg>
+    </button>
+  </div>
+
+  <section id="timeline-page" class="timeline-page" aria-labelledby="timeline-title" hidden>
+    <div class="timeline-shell">
+      <header class="timeline-head">
+        <div>
+          <p class="eyebrow">Travel Timeline</p>
+          <h2 id="timeline-title">旅行时间线</h2>
+        </div>
+        <button id="timeline-close" class="back-button" type="button">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m15 5-7 7 7 7"/></svg>
+          返回地球
+        </button>
+      </header>
+      <main id="timeline-flow" class="timeline-flow" aria-label="按月份排列的旅行足迹"></main>
+      <p id="timeline-empty" class="timeline-empty">还没有足迹。回到地球标记第一座城市吧。</p>
+      <button id="timeline-top" class="timeline-top" type="button" title="回到顶部" aria-label="回到顶部" hidden>
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m18 15-6-6-6 6"/></svg>
+      </button>
+    </div>
+  </section>
+
+  <section id="place-page" class="place-page" aria-labelledby="place-page-title" hidden>
+    <div class="place-shell">
+      <header class="place-head">
+        <div class="place-heading">
+          <h2 id="place-page-title">城市名称</h2>
+          <p id="place-date" class="place-date">2025.06.17 - 2025.06.21</p>
+        </div>
+        <button id="place-back" class="back-button" type="button">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m15 5-7 7 7 7"/></svg>
+          返回
+        </button>
+      </header>
+
+      <div class="place-layout">
+        <aside class="place-days" aria-label="行程日期">
+          <p class="place-rail-title">行程</p>
+          <div id="place-day-list" class="place-day-list"></div>
+        </aside>
+
+        <main class="place-album" aria-label="旅行照片集">
+          <h3 id="place-album-title">城市照片集</h3>
+          <div id="place-photo-groups" class="photo-groups"></div>
+        </main>
+
+        <aside class="place-journal" aria-label="旅行小记">
+          <div class="journal-card">
+            <p id="journal-day" class="journal-day">Day 1</p>
+            <p id="journal-date" class="journal-date">2025年06月17日</p>
+            <p id="journal-city" class="journal-city">城市名</p>
+            <p id="journal-text" class="journal-text">这里的小记还没有填写。</p>
+          </div>
+        </aside>
+      </div>
+    </div>
+
+    <button id="place-edit-fab" class="edit-fab" type="button" title="编辑这条足迹" aria-label="编辑这条足迹">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M17 3a2.8 2.8 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z" /></svg>
+    </button>
+
+    <div id="place-editor" class="place-editor" hidden>
+      <form id="place-edit-form" class="place-editor-shell" novalidate>
+        <header class="place-editor-head">
+          <div>
+            <p class="eyebrow">Detail Editor</p>
+            <h2>编辑详情页</h2>
+          </div>
+          <div class="editor-actions">
+            <button id="place-editor-cancel" type="button" class="text-button">取消</button>
+            <button type="submit" class="primary-button">保存详情</button>
+          </div>
+        </header>
+
+        <div class="place-editor-grid">
+          <section class="editor-panel" aria-label="基础信息">
+            <h3>基础信息</h3>
+            <p class="editor-note">这些字段与城市卡片共用。</p>
+            <label class="edit-field">
+              <span>地点</span>
+              <input id="place-edit-title" type="text" autocomplete="off" spellcheck="false" placeholder="如：浙江杭州" />
+            </label>
+            <div class="date-grid">
+              <label class="edit-field">
+                <span>到达日期</span>
+                <input id="place-edit-arrival" type="date" />
+              </label>
+              <label class="edit-field">
+                <span>离开日期</span>
+                <input id="place-edit-departure" type="date" />
+              </label>
+            </div>
+            <div class="date-grid">
+              <label class="edit-field">
+                <span>行程名称</span>
+                <input id="place-edit-trip-title" type="text" autocomplete="off" placeholder="如：杭州之旅" />
+              </label>
+              <label class="edit-field">
+                <span>天气</span>
+                <input id="place-edit-weather" type="text" autocomplete="off" placeholder="如：天气阴" />
+              </label>
+            </div>
+            <label class="edit-field">
+              <span>城市卡片简介</span>
+              <textarea id="place-edit-summary" rows="6" placeholder="城市卡片上展示的简介……"></textarea>
+            </label>
+          </section>
+
+          <section class="editor-panel" aria-label="每日日记">
+            <h3>每日日记</h3>
+            <p class="editor-note">日记按日期归属到详情页左侧的 Day。</p>
+            <div id="place-journal-editor" class="journal-editor-list"></div>
+            <div class="add-day">
+              <input id="place-new-day-date" type="date" aria-label="新增日记日期" />
+              <button id="place-add-day" type="button" class="text-button">新增日期</button>
+            </div>
+          </section>
+
+          <section class="editor-panel editor-panel-wide" aria-label="旅行照片管理">
+            <div class="section-heading">
+              <div>
+                <h3>旅行照片</h3>
+                <p class="editor-note">拖动照片排序；也可以按住 Alt 使用左右方向键。日期保存后按 Day 分组展示。</p>
+              </div>
+              <span id="photo-status" class="save-status" aria-live="polite"></span>
+            </div>
+            <div id="photo-grid" class="photo-grid"></div>
+            <label class="upload-button" for="photo-input">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 5v14"/><path d="M5 12h14"/></svg>
+              上传旅行照片
+            </label>
+            <input id="photo-input" type="file" accept="image/*" multiple hidden />
+          </section>
+        </div>
+      </form>
+    </div>
+  </section>
+
+  <aside id="detail-panel" class="detail-panel" data-mode="view" aria-labelledby="view-title" tabindex="-1" hidden>
+    <div id="detail-view" class="detail-view">
+      <div id="album" class="album">
+        <div id="album-stage" class="album-stage"></div>
+        <div id="album-empty" class="album-empty" hidden>
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <rect x="3" y="5" width="18" height="14" rx="2" />
+            <circle cx="8.5" cy="10" r="1.6" />
+            <path d="m21 15-4.6-4.6a1.6 1.6 0 0 0-2.3 0L7 17.5" />
+          </svg>
+          <span>还没有照片，编辑这条足迹补几张吧。</span>
+        </div>
+        <button id="album-prev" class="album-nav album-prev" type="button" title="上一张" aria-label="上一张" hidden>
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m15 5-7 7 7 7" /></svg>
+        </button>
+        <button id="album-next" class="album-nav album-next" type="button" title="下一张" aria-label="下一张" hidden>
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m9 5 7 7-7 7" /></svg>
+        </button>
+        <p id="album-counter" class="album-counter" hidden>1 / 2</p>
+      </div>
+
+      <div class="detail-body">
+        <div class="detail-heading">
+          <h2 id="view-title">城市名称</h2>
+          <p id="view-month" class="detail-month">2025年06月</p>
+        </div>
+        <p id="view-summary-line" class="detail-summary-line"></p>
+        <p id="view-desc" class="detail-desc"></p>
+      </div>
+
+      <div class="detail-view-actions">
+        <button id="detail-timeline-button" class="text-button" type="button">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 12h4l2.5-7 5 14L17 12h4" /></svg>
+          详情
+        </button>
+        <button id="detail-edit-button" class="text-button" type="button">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M17 3a2.8 2.8 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z" /></svg>
+          编辑
+        </button>
+      </div>
+
+      <button id="detail-close" class="icon-button detail-close" type="button" title="关闭详情" aria-label="关闭详情">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></svg>
+      </button>
+    </div>
+
+    <form id="detail-edit" class="detail-edit" novalidate>
+      <header class="edit-head">
+        <h2>编辑城市卡片</h2>
+        <button id="edit-close" class="icon-button" type="button" title="返回展示" aria-label="返回展示">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m15 5-7 7 7 7" /></svg>
+        </button>
+      </header>
+
+      <div class="edit-fields">
+        <label class="edit-field">
+          <span>地点</span>
+          <input id="edit-title" type="text" autocomplete="off" spellcheck="false" placeholder="如：浙江杭州" />
+        </label>
+        <div class="date-grid">
+          <label class="edit-field">
+            <span>到达日期</span>
+            <input id="edit-arrival" type="date" />
+          </label>
+          <label class="edit-field">
+            <span>离开日期</span>
+            <input id="edit-departure" type="date" />
+          </label>
+        </div>
+        <div class="date-grid">
+          <label class="edit-field">
+            <span>行程名称</span>
+            <input id="edit-trip-title" type="text" autocomplete="off" placeholder="如：杭州之旅" />
+          </label>
+          <label class="edit-field">
+            <span>天气</span>
+            <input id="edit-weather" type="text" autocomplete="off" placeholder="如：天气阴" />
+          </label>
+        </div>
+        <label class="edit-field">
+          <span>简介</span>
+          <textarea id="edit-summary" rows="4" placeholder="记录这座城市的路线、食物，或最想记住的瞬间……"></textarea>
+        </label>
+      </div>
+
+      <section class="edit-photos" aria-label="时间线封面">
+        <div class="section-heading">
+          <h3>时间线封面</h3>
+          <span id="cover-status" class="save-status" aria-live="polite"></span>
+        </div>
+        <p class="edit-note">上传一张票根形封面，推荐尺寸 1200 × 480；上传后点击封面可调整焦点位置。</p>
+        <div id="cover-preview" class="cover-preview">
+          <img id="cover-image" alt="时间线封面" hidden />
+          <span id="cover-empty" class="cover-empty">还没有封面</span>
+        </div>
+        <div class="cover-actions">
+          <label class="upload-button" for="cover-input">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 5v14"/><path d="M5 12h14"/></svg>
+            上传封面
+          </label>
+          <button id="cover-remove" type="button" class="text-button" hidden>移除</button>
+        </div>
+        <input id="cover-input" type="file" accept="image/*" hidden />
+      </section>
+
+      <footer class="edit-actions">
+        <span id="detail-save-status" class="save-status" aria-live="polite"></span>
+        <div class="edit-actions-buttons">
+          <button id="edit-cancel" type="button" class="text-button">取消</button>
+          <button id="edit-save" type="submit" class="primary-button">保存</button>
+        </div>
+      </footer>
+    </form>
+  </aside>
+
+    <script type="module" src="./src/main.js?v=20260901-8"></script>
+</body>
+</html>

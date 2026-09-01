@@ -1,0 +1,14 @@
+{
+  "name": "xingji-travel-atlas",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Personal travel globe - mark the cities you have been to.",
+  "type": "module",
+  "scripts": {
+    "start": "node server.mjs"
+  },
+  "dependencies": {
+    "three": "^0.180.0",
+    "world-atlas": "^2.0.2"
+  }
+}
