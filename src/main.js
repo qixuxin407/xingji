@@ -3,6 +3,12 @@ import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { LineSegments2 } from 'three/addons/lines/LineSegments2.js';
 import { LineSegmentsGeometry } from 'three/addons/lines/LineSegmentsGeometry.js';
 import { LineMaterial } from 'three/addons/lines/LineMaterial.js';
+import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
+import { ShaderPass } from 'three/addons/postprocessing/ShaderPass.js';
+import { TexturePass } from 'three/addons/postprocessing/TexturePass.js';
+import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
+import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
+import { FXAAPass } from 'three/addons/postprocessing/FXAAPass.js';
 
 /* ------------------------------------------------------------------ */
 /* Basic constants                                                     */
@@ -28,6 +34,13 @@ const OVERPASS_BASE = 'https://overpass-api.de/api/interpreter';
 const API_BASE = '/api';
 const SEARCH_TIMEOUT_MS = 7000;
 const BOUNDARY_TIMEOUT_MS = 18000;
+
+window.addEventListener('error', (event) => {
+  const el = document.createElement('pre');
+  el.style.cssText = 'position:fixed;bottom:0;left:0;right:0;z-index:99999;background:#300;color:#f88;padding:8px 12px;font:12px monospace;max-height:35vh;overflow:auto;white-space:pre-wrap;';
+  el.textContent = 'Error: ' + (event.message || event.error) + '\n' + (event.filename ? event.filename + ':' + event.lineno : '');
+  document.body.appendChild(el);
+});
 
 const REDUCED_MOTION = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
 const DEFAULT_HINT = '输入地名开始搜索，点击结果即可标记。';
@@ -552,6 +565,169 @@ window.addEventListener('pointermove', (event) => {
 }, { passive: true });
 document.documentElement.addEventListener('pointerleave', () => starPointerTarget.set(0, 0));
 
+/* ------------------------------------------------------------------ */
+/* Post-processing pipeline                                            */
+/* ------------------------------------------------------------------ */
+
+let composer = null;
+let sceneRT = null;
+let motionBlurPass = null;
+let dofPass = null;
+const prevProjectionMatrix = new THREE.Matrix4();
+const prevViewMatrix = new THREE.Matrix4();
+
+const MotionBlurShader = {
+  uniforms: {
+    tDiffuse: { value: null },
+    tDepth: { value: null },
+    uCurrViewProj: { value: new THREE.Matrix4() },
+    uPrevViewProj: { value: new THREE.Matrix4() },
+    uInvCurrViewProj: { value: new THREE.Matrix4() },
+    uNear: { value: 0.01 },
+    uFar: { value: 120 },
+    uStrength: { value: REDUCED_MOTION ? 0 : 0.65 },
+    uResolution: { value: new THREE.Vector2(1, 1) },
+  },
+  vertexShader: /* glsl */ `
+    varying vec2 vUv;
+    void main() {
+      vUv = uv;
+      gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+    }`,
+  fragmentShader: /* glsl */ `
+    uniform sampler2D tDiffuse;
+    uniform sampler2D tDepth;
+    uniform mat4 uCurrViewProj;
+    uniform mat4 uPrevViewProj;
+    uniform mat4 uInvCurrViewProj;
+    uniform float uNear, uFar, uStrength;
+    uniform vec2 uResolution;
+    varying vec2 vUv;
+
+    void main() {
+      if (uStrength <= 0.001) { gl_FragColor = texture2D(tDiffuse, vUv); return; }
+      float d = texture2D(tDepth, vUv).r;
+      float z = d * 2.0 - 1.0;
+      vec4 clipPos = vec4(vUv * 2.0 - 1.0, z, 1.0);
+      vec4 viewPos = uInvCurrViewProj * clipPos;
+      vec3 worldPos = viewPos.xyz / viewPos.w;
+      vec4 prevClip = uPrevViewProj * vec4(worldPos, 1.0);
+      vec2 prevUv = (prevClip.xy / prevClip.w) * 0.5 + 0.5;
+      vec2 velocity = (vUv - prevUv) * uStrength;
+      float velPx = length(velocity * uResolution);
+      velocity = clamp(velocity, vec2(-2.0 / uResolution.x, -2.0 / uResolution.y), vec2(2.0 / uResolution.x, 2.0 / uResolution.y));
+      vec3 col = texture2D(tDiffuse, vUv).rgb;
+      if (velPx > 0.15) {
+        vec3 acc = col * 0.25;
+        for (int i = 1; i <= 5; i++) {
+          float t = float(i) / 5.0;
+          acc += texture2D(tDiffuse, vUv + velocity * (t - 0.5)).rgb * 0.15;
+        }
+        col = acc;
+      }
+      gl_FragColor = vec4(col, 1.0);
+    }`,
+};
+
+const DOFShader = {
+  uniforms: {
+    tDiffuse: { value: null },
+    tDepth: { value: null },
+    uNear: { value: 0.01 },
+    uFar: { value: 120 },
+    uFocusDist: { value: 2.9 },
+    uAperture: { value: REDUCED_MOTION ? 0 : 0.014 },
+    uResolution: { value: new THREE.Vector2(1, 1) },
+  },
+  vertexShader: /* glsl */ `
+    varying vec2 vUv;
+    void main() {
+      vUv = uv;
+      gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+    }`,
+  fragmentShader: /* glsl */ `
+    uniform sampler2D tDiffuse;
+    uniform sampler2D tDepth;
+    uniform float uNear, uFar, uFocusDist, uAperture;
+    uniform vec2 uResolution;
+    varying vec2 vUv;
+
+    float linearizeDepth(float d) {
+      float z = d * 2.0 - 1.0;
+      return (2.0 * uNear * uFar) / (uFar + uNear - z * (uFar - uNear));
+    }
+
+    void main() {
+      if (uAperture <= 0.001) { gl_FragColor = texture2D(tDiffuse, vUv); return; }
+      float d = texture2D(tDepth, vUv).r;
+      float linDepth = linearizeDepth(d);
+      float coc = abs(linDepth - uFocusDist) / uFocusDist * uAperture;
+      coc = clamp(coc, 0.0, 1.0);
+      float radius = coc * 3.5;
+      if (radius < 0.3) { gl_FragColor = texture2D(tDiffuse, vUv); return; }
+      vec2 texel = 1.0 / uResolution;
+      vec3 acc = vec3(0.0);
+      float total = 0.0;
+      for (int i = 0; i < 8; i++) {
+        float angle = float(i) * 0.7853981634;
+        vec2 offs = vec2(cos(angle), sin(angle)) * radius * texel;
+        float w = 1.0;
+        acc += texture2D(tDiffuse, vUv + offs).rgb * w;
+        total += w;
+      }
+      gl_FragColor = vec4(acc / total, 1.0);
+    }`,
+};
+
+if (renderer) {
+  try {
+    renderer.toneMapping = THREE.ACESFilmicToneMapping;
+    renderer.toneMappingExposure = 1.0;
+    renderer.outputColorSpace = THREE.SRGBColorSpace;
+
+    const size = renderer.getDrawingBufferSize(new THREE.Vector2());
+    sceneRT = new THREE.WebGLRenderTarget(size.width, size.height, {
+      type: THREE.HalfFloatType,
+      depthBuffer: true,
+    });
+
+    const depthTex = new THREE.DepthTexture(size.width, size.height);
+    depthTex.type = THREE.UnsignedIntType;
+    sceneRT.depthTexture = depthTex;
+
+    composer = new EffectComposer(renderer);
+    const sceneTexturePass = new TexturePass(sceneRT.texture);
+    sceneTexturePass.needsSwap = false;
+    sceneTexturePass.material.blending = THREE.NoBlending;
+    sceneTexturePass.material.transparent = false;
+    sceneTexturePass.uniforms.tDiffuse.value = sceneRT.texture;
+    composer.addPass(sceneTexturePass);
+
+    motionBlurPass = new ShaderPass(MotionBlurShader);
+    motionBlurPass.uniforms.tDepth.value = depthTex;
+    motionBlurPass.uniforms.uResolution.value.set(size.width, size.height);
+    composer.addPass(motionBlurPass);
+
+    dofPass = new ShaderPass(DOFShader);
+    dofPass.uniforms.tDepth.value = depthTex;
+    dofPass.uniforms.uResolution.value.set(size.width, size.height);
+    composer.addPass(dofPass);
+
+    const bloomPass = new UnrealBloomPass(new THREE.Vector2(size.width, size.height), 0.28, 0.55, 0.72);
+    composer.addPass(bloomPass);
+
+    const fxaaPass = new FXAAPass();
+    composer.addPass(fxaaPass);
+
+    composer.addPass(new OutputPass());
+  } catch (err) {
+    console.error('Post-processing setup failed:', err);
+    composer = null;
+    motionBlurPass = null;
+    dofPass = null;
+  }
+}
+
 scene.add(new THREE.AmbientLight(0xffffff, 1)); // shaders are custom; light keeps future mats simple
 
 // Uniformly lit Blue Marble base map, with a small offline-safe fallback texture.
@@ -583,20 +759,12 @@ const globeMat = new THREE.ShaderMaterial({
     varying vec3 vNormalW;
     varying vec3 vPosW;
 
-    vec3 linearToSRGB(vec3 color) {
-      vec3 low = color * 12.92;
-      vec3 high = pow(color, vec3(0.4166667)) * 1.055 - 0.055;
-      return mix(low, high, step(vec3(0.0031308), color));
-    }
-
     void main() {
       vec3 n = normalize(vNormalW);
       vec3 vDir = normalize(cameraPosition - vPosW);
       vec4 mapColor = texture2D(uMap, vUv);
 
-      // The 16K texture uses an sRGB internal format, so its texels arrive in
-      // linear space. Convert once at the end because this custom shader is
-      // responsible for its own output transform.
+      // HDR pipeline: OutputPass handles tone mapping and sRGB conversion.
       vec3 col = pow(mapColor.rgb, vec3(0.88)) * 1.08 + vec3(0.008, 0.014, 0.024);
 
       float facing = max(dot(n, vDir), 0.0);
@@ -606,8 +774,7 @@ const globeMat = new THREE.ShaderMaterial({
       col = mix(col, col * 0.88 + uRim * 0.48, rayleigh * 0.36);
       col += uSunTint * mie * 0.14;
       col += vec3(0.012, 0.026, 0.052) * rayleigh;
-      col = clamp(col, 0.0, 1.0);
-      col = linearToSRGB(col);
+      col = clamp(col, 0.0, 4.0);
       gl_FragColor = vec4(col, 1.0);
     }`,
 });
@@ -627,71 +794,115 @@ new THREE.TextureLoader().load(
   (err) => console.warn('Unable to load Earth texture', err),
 );
 
-// A moving cirrus layer. Procedural noise keeps the bundle small while giving
-// the surface believable scale and atmospheric motion.
-	const cloudMat = new THREE.ShaderMaterial({
+// Volumetric cloud shell with raymarching for a physically-plausible feel.
+const CLOUD_INNER = GLOBE_R * 1.003;
+const CLOUD_OUTER = GLOBE_R * 1.017;
+const cloudMat = new THREE.ShaderMaterial({
   transparent: true,
   depthWrite: false,
-  uniforms: { uTime: { value: 0 }, uMotion: { value: REDUCED_MOTION ? 0 : 1 } },
+  side: THREE.FrontSide,
+  uniforms: {
+    uTime: { value: 0 },
+    uMotion: { value: REDUCED_MOTION ? 0 : 1 },
+    uInner: { value: CLOUD_INNER },
+    uOuter: { value: CLOUD_OUTER },
+  },
   vertexShader: /* glsl */ `
-    varying vec2 vUv;
-    varying vec3 vNormalW;
     varying vec3 vPosW;
     void main() {
-      vUv = uv;
-      vNormalW = normalize(mat3(modelMatrix) * normal);
       vec4 wp = modelMatrix * vec4(position, 1.0);
       vPosW = wp.xyz;
       gl_Position = projectionMatrix * viewMatrix * wp;
     }`,
   fragmentShader: /* glsl */ `
-    uniform float uTime, uMotion;
-    varying vec2 vUv;
-    varying vec3 vNormalW;
+    uniform float uTime, uMotion, uInner, uOuter;
     varying vec3 vPosW;
 
-    float hash(vec2 p) {
-      return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453);
+    float hash13(vec3 p) {
+      p = fract(p * 0.3183099 + 0.1);
+      p *= 17.0;
+      return fract(p.x * p.y * p.z * (p.x + p.y + p.z));
     }
 
-    float noise(vec2 p) {
-      vec2 i = floor(p);
-      vec2 f = fract(p);
-      vec2 u = f * f * (3.0 - 2.0 * f);
+    float noise3(vec3 x) {
+      vec3 i = floor(x);
+      vec3 f = fract(x);
+      f = f * f * (3.0 - 2.0 * f);
       return mix(
-        mix(hash(i), hash(i + vec2(1.0, 0.0)), u.x),
-        mix(hash(i + vec2(0.0, 1.0)), hash(i + vec2(1.0, 1.0)), u.x),
-        u.y
-      );
+        mix(mix(hash13(i), hash13(i + vec3(1,0,0)), f.x),
+            mix(hash13(i + vec3(0,1,0)), hash13(i + vec3(1,1,0)), f.x), f.y),
+        mix(mix(hash13(i + vec3(0,0,1)), hash13(i + vec3(1,0,1)), f.x),
+            mix(hash13(i + vec3(0,1,1)), hash13(i + vec3(1,1,1)), f.x), f.y),
+        f.z);
     }
 
-    float fbm(vec2 p) {
-      float value = 0.0;
-      float amplitude = 0.54;
-      for (int i = 0; i < 5; i++) {
-        value += amplitude * noise(p);
-        p = p * 2.04 + vec2(13.2, 7.7);
-        amplitude *= 0.52;
+    float fbm3(vec3 p) {
+      float v = 0.0;
+      float a = 0.52;
+      for (int i = 0; i < 4; i++) {
+        v += a * noise3(p);
+        p = p * 2.08 + vec3(3.1, 7.7, 1.3);
+        a *= 0.48;
       }
-      return value;
+      return v;
+    }
+
+    float cloudDensity(vec3 pos) {
+      float wind = uTime * uMotion * 0.006;
+      float ca = cos(wind), sa = sin(wind);
+      vec3 p = vec3(pos.x * ca + pos.z * sa, pos.y, -pos.x * sa + pos.z * ca);
+      p *= 18.0;
+      vec3 q = vec3(
+        fbm3(p + vec3(0.0, uTime * uMotion * 0.015, 0.0)),
+        fbm3(p + vec3(5.2, 1.3, 0.0)),
+        fbm3(p + vec3(0.0, 8.2, 3.7)));
+      float n = fbm3(p + q * 0.9);
+      float lat = asin(clamp(p.y / (18.0 * length(pos)), -1.0, 1.0));
+      float band = 0.68 + 0.32 * cos(lat * 5.0);
+      float coverage = smoothstep(0.42, 0.68, n * band);
+      float h = (length(pos) - uInner) / (uOuter - uInner);
+      float vert = smoothstep(0.0, 0.25, h) * smoothstep(1.0, 0.75, h);
+      return coverage * vert;
     }
 
     void main() {
-      float drift = uTime * uMotion * 0.0022;
-      vec2 p = vec2(vUv.x * 16.0 + drift, vUv.y * 8.0);
-      float shape = fbm(p + fbm(p * 1.7) * 0.65);
-      float bands = 0.76 + 0.24 * sin(vUv.y * 28.0 + fbm(p * 0.4) * 4.0);
-      float coverage = smoothstep(0.57, 0.82, shape * bands);
-      float edge = smoothstep(0.0, 0.14, vUv.y) * smoothstep(1.0, 0.86, vUv.y);
-      vec3 n = normalize(vNormalW);
-      vec3 vDir = normalize(cameraPosition - vPosW);
-      float facing = max(dot(n, vDir), 0.0);
-      float shade = 0.82 + 0.18 * facing;
-      float limbFade = smoothstep(0.0, 0.24, facing);
-      gl_FragColor = vec4(vec3(0.965, 0.978, 1.0) * shade, coverage * edge * limbFade * 0.30);
+      vec3 ro = cameraPosition;
+      vec3 rd = normalize(vPosW - ro);
+      float tOuter = length(vPosW - ro);
+      float b = dot(ro, rd);
+      float tFar;
+      float discInner = b * b - (dot(ro, ro) - uInner * uInner);
+      if (discInner > 0.0) {
+        tFar = -b - sqrt(discInner);
+      } else {
+        float discOuter = b * b - (dot(ro, ro) - uOuter * uOuter);
+        tFar = -b + sqrt(max(discOuter, 0.0));
+      }
+      float span = tFar - tOuter;
+      if (span < 0.0005) { gl_FragColor = vec4(0.0, 0.0, 0.0, 0.0); return; }
+
+      const int STEPS = 24;
+      float dt = span / float(STEPS);
+      float alpha = 0.0;
+      vec3 acc = vec3(0.0);
+      for (int i = 0; i < STEPS; i++) {
+        float t = tOuter + (float(i) + 0.5) * dt;
+        vec3 pos = ro + rd * t;
+        float d = cloudDensity(pos);
+        if (d > 0.002) {
+          float limb = 1.0 - abs(dot(rd, normalize(pos)));
+          float light = 0.72 + 0.28 * limb;
+          vec3 cloudCol = vec3(0.88, 0.92, 0.98) * light;
+          float a = d * dt * 14.0;
+          acc += (1.0 - alpha) * cloudCol * min(a, 1.0);
+          alpha += (1.0 - alpha) * min(a, 1.0);
+          if (alpha > 0.98) break;
+        }
+      }
+      gl_FragColor = vec4(acc, alpha);
     }`,
 });
-const clouds = new THREE.Mesh(new THREE.SphereGeometry(GLOBE_R * 1.011, 128, 80), cloudMat);
+const clouds = new THREE.Mesh(new THREE.SphereGeometry(CLOUD_OUTER, 96, 64), cloudMat);
 clouds.renderOrder = 0;
 scene.add(clouds);
 
@@ -721,17 +932,20 @@ const haloMat = new THREE.ShaderMaterial({
     void main() {
       vec3 n = normalize(vNormalW);
       vec3 vDir = normalize(cameraPosition - vPosW);
-      float angle = 1.0 - abs(dot(n, vDir));
-      float broad = pow(angle, 3.0);
-      float rayleigh = pow(angle, 4.0);
-      float mie = pow(angle, 11.0);
-      vec3 color = uRayleigh * (rayleigh * 0.52 + broad * 0.10)
-        + uMie * mie * 0.40;
-      float alpha = clamp(rayleigh * 0.50 + broad * 0.08 + mie * 0.20, 0.0, 1.0);
+      float facing = abs(dot(n, vDir));
+      float rim = 1.0 - facing;
+      float inner = pow(rim, 2.0);
+      float mid = pow(rim, 4.0);
+      float outer = pow(rim, 7.0);
+      vec3 color = uRayleigh * (inner * 0.30 + mid * 0.42)
+        + uMie * outer * 0.38;
+      float alpha = clamp(inner * 0.22 + mid * 0.38 + outer * 0.28, 0.0, 1.0);
+      color *= 1.25;
       gl_FragColor = vec4(color, alpha);
     }`,
 });
-const halo = new THREE.Mesh(new THREE.SphereGeometry(GLOBE_R * 1.11, 72, 52), haloMat);
+const halo = new THREE.Mesh(new THREE.SphereGeometry(GLOBE_R * 1.13, 72, 52), haloMat);
+halo.renderOrder = 1;
 scene.add(halo);
 
 // Graticule (very quiet)
@@ -1521,6 +1735,10 @@ async function addPhotos(files) {
   const detail = getDetail(id);
   const images = [...files].filter((file) => file.type.startsWith('image/'));
   if (!images.length) return;
+  const placeEditorId = isPlaceEditorOpen() ? currentPlacePageId : '';
+  const uploadDate = placeEditorId === id
+    ? selectedTripDate
+    : (detail.arrival || toISODate(new Date()));
   uploadButton.classList.add('is-loading');
   setPhotoStatus('正在导入照片…');
   let added = 0;
@@ -1534,7 +1752,7 @@ async function addPhotos(files) {
       detail.photos.push({
         id: photoId,
         caption: '',
-        date: detail.arrival || toISODate(new Date()),
+        date: uploadDate,
         ts: Date.now(),
         order: detail.photos.length,
       });
@@ -1542,8 +1760,13 @@ async function addPhotos(files) {
     }
     persist();
     if (renderingPlaceId === id) renderPhotoGrid(id);
-    if (renderingPlacePageId === id) renderPlacePage(id);
-    setPhotoStatus(`已添加 ${added} 张照片`);
+    if (renderingPlacePageId === id) {
+      if (isPlaceEditorOpen()) renderPhotoGrid(id);
+      else renderPlacePage(id);
+    }
+    setPhotoStatus(uploadDate
+      ? `已添加 ${added} 张照片到 ${shortDate(uploadDate)}`
+      : `已添加 ${added} 张照片到未定日期`);
   } catch (err) {
     console.warn('Photo upload failed', err);
     setPhotoStatus('照片保存失败，请重试', true);
@@ -2381,6 +2604,7 @@ const timelineTopButton = document.getElementById('timeline-top');
 const TIMELINE_HASH = '#/timeline';
 let timelineHideTimer = null;
 let lastFocusedElement = null;
+let placeReturnTicketId = '';
 
 function tripDate(meta) {
   const detail = getDetail(meta.id);
@@ -2456,6 +2680,7 @@ function renderTimeline() {
       const button = document.createElement('button');
       button.type = 'button';
       button.className = 'trip-card';
+      button.dataset.placeId = meta.id;
       button.setAttribute('aria-label', `查看 ${meta.name}`);
       button.addEventListener('pointermove', (event) => {
         const rect = button.getBoundingClientRect();
@@ -2485,6 +2710,7 @@ function renderTimeline() {
       }
       button.addEventListener('click', () => {
         placeReturnHash = TIMELINE_HASH;
+        placeReturnTicketId = meta.id;
         location.hash = `/place/${meta.id}`;
       });
       ticket.append(label, button);
@@ -2497,6 +2723,23 @@ function renderTimeline() {
   }
 
   timelineFlow.appendChild(fragment);
+}
+
+function focusReturnedTicket(ticketId) {
+  if (!ticketId || !isTimelineRoute() || timelinePage.hidden) return false;
+  const button = timelinePage.querySelector(
+    `.trip-card[data-place-id="${CSS.escape(ticketId)}"]`
+  );
+  if (!button) return false;
+  button.scrollIntoView({
+    block: 'center',
+    inline: 'nearest',
+    behavior: REDUCED_MOTION ? 'auto' : 'smooth',
+  });
+  button.focus({ preventScroll: true });
+  button.classList.add('is-return-focus');
+  setTimeout(() => button.classList.remove('is-return-focus'), 1500);
+  return true;
 }
 
 function isTimelineRoute() {
@@ -2516,14 +2759,19 @@ function openTimeline() {
   timelinePage.hidden = false;
   timelinePage.scrollTop = 0;
   lastFocusedElement = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+  const returnTicketId = placeReturnTicketId;
+  placeReturnTicketId = '';
   ensureTimelineCoverUrls()
     .then(() => {
       if (isTimelineRoute()) renderTimeline();
+      if (isTimelineRoute()) focusReturnedTicket(returnTicketId);
     })
     .catch((err) => console.warn('Unable to load timeline covers', err));
   requestAnimationFrame(() => {
     timelinePage.classList.add('is-open');
-    timelineCloseButton.focus({ preventScroll: true });
+    if (!focusReturnedTicket(returnTicketId)) {
+      timelineCloseButton.focus({ preventScroll: true });
+    }
   });
 }
 
@@ -3119,6 +3367,13 @@ window.addEventListener('resize', () => {
   camera.aspect = window.innerWidth / window.innerHeight;
   camera.updateProjectionMatrix();
   renderer.setSize(window.innerWidth, window.innerHeight);
+  if (composer) {
+    const sz = renderer.getDrawingBufferSize(new THREE.Vector2());
+    composer.setSize(sz.width, sz.height);
+    sceneRT?.setSize(sz.width, sz.height);
+    if (motionBlurPass) motionBlurPass.uniforms.uResolution.value.set(sz.width, sz.height);
+    if (dofPass) dofPass.uniforms.uResolution.value.set(sz.width, sz.height);
+  }
   const w = window.innerWidth;
   const h = window.innerHeight;
   lineResolution.set(w, h);
@@ -3172,7 +3427,32 @@ function tick() {
     controls.autoRotate = !REDUCED_MOTION && selectedPlaceId === null && (performance.now() - lastInteract > 6000);
     controls.update();
   }
-  renderer?.render(scene, camera);
+  if (composer) {
+    camera.updateMatrixWorld();
+    camera.matrixWorldInverse.copy(camera.matrixWorld).invert();
+    if (motionBlurPass) {
+      motionBlurPass.uniforms.uCurrViewProj.value.multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse);
+      motionBlurPass.uniforms.uPrevViewProj.value.multiplyMatrices(prevProjectionMatrix, prevViewMatrix);
+      motionBlurPass.uniforms.uInvCurrViewProj.value.copy(motionBlurPass.uniforms.uCurrViewProj.value).invert();
+      motionBlurPass.uniforms.uNear.value = camera.near;
+      motionBlurPass.uniforms.uFar.value = camera.far;
+    }
+    if (dofPass) {
+      dofPass.uniforms.uNear.value = camera.near;
+      dofPass.uniforms.uFar.value = camera.far;
+      dofPass.uniforms.uFocusDist.value = camera.position.length();
+    }
+    prevProjectionMatrix.copy(camera.projectionMatrix);
+    prevViewMatrix.copy(camera.matrixWorldInverse);
+
+    renderer.setRenderTarget(sceneRT);
+    renderer.clear();
+    renderer.render(scene, camera);
+    renderer.setRenderTarget(null);
+    composer.render();
+  } else {
+    renderer?.render(scene, camera);
+  }
 }
 
 document.addEventListener('visibilitychange', () => {

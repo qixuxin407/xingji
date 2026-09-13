@@ -1167,6 +1167,19 @@ body[data-route='place'] .detail-panel {
 
 .trip-card:active { transform: translateY(-1px) scale(0.995); }
 
+.trip-card.is-return-focus {
+  animation: ticket-return-glow 1.4s ease-out both;
+}
+
+@keyframes ticket-return-glow {
+  0% {
+    box-shadow: 0 0 0 2px rgba(245, 165, 36, 0.72), 0 18px 46px rgba(245, 165, 36, 0.20);
+  }
+  100% {
+    box-shadow: 0 0 0 2px rgba(245, 165, 36, 0), 0 18px 40px rgba(0, 0, 0, 0.26);
+  }
+}
+
 .trip-cover-label {
   font-family: var(--font-mono);
   font-size: 11px;
